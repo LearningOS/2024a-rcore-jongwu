@@ -20,8 +20,9 @@ use crate::sync::UPSafeCell;
 use lazy_static::*;
 use switch::__switch;
 pub use task::{TaskControlBlock, TaskStatus};
-
+use crate::syscall::process::TaskInfo;
 pub use context::TaskContext;
+use crate::timer::get_time_us;
 
 /// The task manager, where all the tasks are managed.
 ///
@@ -45,6 +46,8 @@ pub struct TaskManagerInner {
     tasks: [TaskControlBlock; MAX_APP_NUM],
     /// id of current `Running` task
     current_task: usize,
+    /// task info
+    task_infos: [TaskInfo; MAX_APP_NUM],
 }
 
 lazy_static! {
@@ -59,12 +62,14 @@ lazy_static! {
             task.task_cx = TaskContext::goto_restore(init_app_cx(i));
             task.task_status = TaskStatus::Ready;
         }
+        let task_infos = [TaskInfo::init(); MAX_APP_NUM];
         TaskManager {
             num_app,
             inner: unsafe {
                 UPSafeCell::new(TaskManagerInner {
                     tasks,
                     current_task: 0,
+                    task_infos,
                 })
             },
         }
@@ -78,6 +83,17 @@ impl TaskManager {
     /// But in ch3, we load apps statically, so the first task is a real app.
     fn run_first_task(&self) -> ! {
         let mut inner = self.inner.exclusive_access();
+        if inner.task_infos[0].is_first_run {
+            inner.task_infos[0].is_first_run = false;
+        }
+
+        let current = inner.current_task;
+        if current >= 0 as usize {
+//            println!("------------- run_first_task: current= {}, last= {}, now = {}\n", current, inner.task_infos[current].last, get_time());
+            inner.task_infos[current].time += get_time_us() - inner.task_infos[current].last;
+        }
+        inner.task_infos[0].last = get_time_us();
+
         let task0 = &mut inner.tasks[0];
         task0.task_status = TaskStatus::Running;
         let next_task_cx_ptr = &task0.task_cx as *const TaskContext;
@@ -104,6 +120,30 @@ impl TaskManager {
         inner.tasks[current].task_status = TaskStatus::Exited;
     }
 
+    /// get current task's control block
+    fn get_current_task(&self) -> Option<TaskInfo> {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        let task = inner.tasks[current];
+        inner.task_infos[current].status = task.task_status;
+        inner.task_infos[current].current = current;
+        Some(inner.task_infos[current])
+    }
+
+    /// incrace a certern syscall times for current task
+    fn inc_task_syscall(&self, id: usize) {
+       let mut inner = self.inner.exclusive_access();
+       let current = inner.current_task;
+       inner.task_infos[current].syscall_times[id] += 1;
+    }
+
+    /// incrace running time of current task
+/*    fn inc_task_run_time(&self, t: usize) {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.task_infos[current].time += t;
+    }
+*/
     /// Find next task to run and return task id.
     ///
     /// In this case, we only return the first `Ready` task in task list.
@@ -121,8 +161,19 @@ impl TaskManager {
         if let Some(next) = self.find_next_task() {
             let mut inner = self.inner.exclusive_access();
             let current = inner.current_task;
+//            let now = get_time();
             inner.tasks[next].task_status = TaskStatus::Running;
             inner.current_task = next;
+            if inner.task_infos[next].is_first_run {
+                inner.task_infos[next].is_first_run = false;
+            }
+            
+            inner.task_infos[next].last = get_time_us();
+            if current >= 0 as usize {
+                inner.task_infos[current].time += get_time_us() - inner.task_infos[next].last;
+            }
+            println!("----------- run_next_task: current = {}, next = {}, last = {}, current task's time = {}\n", current, next, inner.task_infos[next].last, inner.task_infos[current].time);
+            
             let current_task_cx_ptr = &mut inner.tasks[current].task_cx as *mut TaskContext;
             let next_task_cx_ptr = &inner.tasks[next].task_cx as *const TaskContext;
             drop(inner);
@@ -168,4 +219,14 @@ pub fn suspend_current_and_run_next() {
 pub fn exit_current_and_run_next() {
     mark_current_exited();
     run_next_task();
+}
+
+/// Get current task control block
+pub fn get_current_task() -> Option<TaskInfo> {
+    TASK_MANAGER.get_current_task()
+}
+
+/// incrace syscall time for current task
+pub fn inc_task_syscall(id: usize) {
+    TASK_MANAGER.inc_task_syscall(id)
 }
